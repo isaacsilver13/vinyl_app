@@ -1,0 +1,16 @@
+{
+  "name": "vinyl-smtp-test",
+  "version": "1.0.0",
+  "description": "SMTP test helpers for Vinyl alerts",
+  "main": "test_send.js",
+  "scripts": {
+    "test-send": "node test_send.js"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.3",
+    "dotenv": "^16.0.3"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}

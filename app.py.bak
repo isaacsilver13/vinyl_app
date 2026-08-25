@@ -1,0 +1,952 @@
+from __future__ import annotations
+
+import logging
+import os
+import random
+import sys
+from datetime import datetime, timezone
+
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+# Make sure imports resolve when running from the vinyl/ directory
+sys.path.insert(0, os.path.dirname(__file__))
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+
+import database as db
+import discogs_api as api
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+
+st.set_page_config(
+    page_title="Vinyl Catalog",
+    page_icon="🎵",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ── Init DB ───────────────────────────────────────────────────────────────────
+
+db.init_db()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _decade(year, override=None) -> str | None:
+    y = override or year
+    if not y:
+        return None
+    return f"{(int(y) // 10) * 10}s"
+
+
+def _format_last_sync(ts: str | None) -> str:
+    if not ts:
+        return "Never"
+    dt = datetime.fromisoformat(ts).replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - dt
+    hours = int(delta.total_seconds() // 3600)
+    if hours < 1:
+        return "Less than 1 hour ago"
+    if hours == 1:
+        return "1 hour ago"
+    if hours < 24:
+        return f"{hours} hours ago"
+    days = hours // 24
+    return f"{days} day{'s' if days > 1 else ''} ago"
+
+
+def _cover(url: str | None, width: int = 120):
+    if url:
+        st.image(url, width=width)
+    else:
+        st.markdown(
+            f"<div style='width:{width}px;height:{width}px;background:#2a2a2a;"
+            f"display:flex;align-items:center;justify-content:center;"
+            f"border-radius:4px;color:#666;font-size:28px'>🎵</div>",
+            unsafe_allow_html=True,
+        )
+
+
+_NOTABLE_DESCS = {
+    "180g", "180 Gram", "Gatefold", "Limited Edition", "Reissue",
+    "Remastered", "Picture Disc", "Numbered", "Promo", "Test Pressing",
+    "White Label", "Etched", "Colored",
+}
+
+
+def _color_dot(text: str) -> str:
+    if not text:
+        return ""
+    t = text.lower()
+    if any(w in t for w in ("red", "crimson", "scarlet", "pink", "rose")):
+        return "🔴"
+    if any(w in t for w in ("blue", "navy", "cobalt", "sapphire", "cyan", "teal")):
+        return "🔵"
+    if any(w in t for w in ("green", "emerald", "olive", "mint")):
+        return "🟢"
+    if any(w in t for w in ("yellow", "gold", "amber")):
+        return "🟡"
+    if any(w in t for w in ("orange",)):
+        return "🟠"
+    if any(w in t for w in ("white", "clear", "transparent", "crystal", "silver", "grey", "gray", "cream")):
+        return "⚪"
+    if any(w in t for w in ("purple", "violet", "maroon", "burgundy", "magenta", "lilac")):
+        return "🟣"
+    if any(w in t for w in ("brown",)):
+        return "🟤"
+    if any(w in t for w in ("black",)):
+        return ""
+    return "🎨"
+
+
+def _pressing_badge(r: dict) -> str:
+    """Build a one-line pressing summary, e.g. '🔴 Red Vinyl  ·  180g  ·  Gatefold'."""
+    color_text = r.get("format_text") or ""
+    descs      = r.get("format_descriptions") or []
+    notable    = [d for d in descs if d in _NOTABLE_DESCS]
+    parts: list[str] = []
+    if color_text:
+        dot = _color_dot(color_text)
+        parts.append(f"{dot} {color_text}".strip())
+    parts.extend(notable)
+    return "  ·  ".join(parts)
+
+
+
+
+if "startup_sync_done" not in st.session_state:
+    st.session_state["startup_sync_done"] = True
+    if os.environ.get("DISCOGS_TOKEN"):
+        try:
+            with db.get_conn() as conn:
+                meta = db.get_sync_meta(conn)
+            # Only trigger the background hint — actual sync is done via button
+            # to avoid blocking the initial page load for large collections.
+            # If DB is empty, prompt the user to sync.
+            with db.get_conn() as conn:
+                releases = db.get_all_releases(conn)
+            if not releases:
+                st.session_state["show_empty_warning"] = True
+            else:
+                from datetime import timedelta
+                last = meta.get("last_full_sync")
+                if last:
+                    age = datetime.now(timezone.utc) - datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
+                    if age >= timedelta(hours=24):
+                        st.session_state["auto_sync_needed"] = True
+        except Exception:
+            pass
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+with db.get_conn() as _conn:
+    _meta = db.get_sync_meta(_conn)
+
+with st.sidebar:
+    st.title("🎵 Vinyl Catalog")
+    st.caption(f"Last synced: {_format_last_sync(_meta.get('last_full_sync'))}")
+
+    if st.button("🔄 Re-sync Now", width = 'stretch'):
+        with st.status("Syncing collection from Discogs…", expanded=True) as sync_status:
+            try:
+                count = api.sync_collection(force=True, log_fn=sync_status.write)
+                sync_status.update(label=f"✅ Synced {count} records.", state="complete")
+                st.session_state.pop("show_empty_warning", None)
+                st.session_state.pop("auto_sync_needed", None)
+                st.rerun()
+            except EnvironmentError as e:
+                sync_status.update(label="❌ Configuration error", state="error")
+                st.error(str(e))
+            except Exception as e:
+                sync_status.update(label="❌ Sync failed", state="error")
+                st.error(f"Sync failed: {e}")
+
+    if st.session_state.get("auto_sync_needed"):
+        st.info("Collection cache is > 24 h old. Click Re-sync to refresh.")
+
+    st.divider()
+
+    page = st.radio(
+        "Navigate",
+        ["Browse", "Play Log", "Duplicates", "Stats", "Discover", "Wantlist"],
+        label_visibility="collapsed",
+    )
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+
+with db.get_conn() as _conn:
+    _all_releases   = db.get_all_releases(_conn)
+    _play_stats     = db.get_play_stats(_conn)
+    _custom_tags_cache: dict[int, dict] = {}
+
+
+def _get_ct(release_id: int) -> dict:
+    if release_id not in _custom_tags_cache:
+        with db.get_conn() as conn:
+            _custom_tags_cache[release_id] = db.get_custom_tags(conn, release_id)
+    return _custom_tags_cache[release_id]
+
+
+# ── Empty state warning ───────────────────────────────────────────────────────
+
+if st.session_state.get("show_empty_warning"):
+    st.warning(
+        "Your collection is empty. Click **Re-sync Now** in the sidebar to import "
+        "your Discogs collection. Make sure `DISCOGS_TOKEN` and `DISCOGS_USERNAME` "
+        "are set in `vinyl/.env`."
+    )
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: BROWSE
+# ═════════════════════════════════════════════════════════════════════════════
+
+if page == "Browse":
+    st.markdown(
+        """<style>
+        @media (max-width: 768px) {
+            .block-container { padding: 1rem 0.5rem !important; }
+        }
+        </style>""",
+        unsafe_allow_html=True,
+    )
+
+    if not _all_releases:
+        st.info("No records found. Use Re-sync Now to import your collection.")
+        st.stop()
+
+    # Build filter metadata with counts
+    from collections import Counter as _Counter
+    genre_counter:  _Counter = _Counter()
+    decade_counter: _Counter = _Counter()
+    tag_counter:    _Counter = _Counter()
+
+    for r in _all_releases:
+        for g in r["discogs_genres"]:
+            genre_counter[g] += 1
+        ct = _get_ct(r["release_id"])
+        d  = _decade(r["year"], ct.get("decade_override"))
+        if d:
+            decade_counter[d] += 1
+        for t in ct.get("custom_tags", []):
+            tag_counter[t] += 1
+
+    all_genres      = set(genre_counter)
+    all_decades     = set(decade_counter)
+    all_custom_tags = set(tag_counter)
+
+    genre_opts  = sorted(f"{g} ({genre_counter[g]})"  for g in all_genres)
+    decade_opts = sorted(f"{d} ({decade_counter[d]})" for d in all_decades)
+    tag_opts    = sorted(f"{t} ({tag_counter[t]})"    for t in all_custom_tags)
+
+    def _strip_count(label: str) -> str:
+        return label.rsplit(" (", 1)[0]
+
+    with st.sidebar:
+        st.subheader("Filters & Sort")
+        sel_genre_labels  = st.multiselect("Genre",      genre_opts)
+        sel_decade_labels = st.multiselect("Decade",     decade_opts)
+        sel_tag_labels    = st.multiselect("Custom Tag", tag_opts)
+        sel_genres  = [_strip_count(l) for l in sel_genre_labels]
+        sel_decades = [_strip_count(l) for l in sel_decade_labels]
+        sel_tags    = [_strip_count(l) for l in sel_tag_labels]
+
+        _SORT_OPTIONS = [
+            "Artist A→Z", "Artist Z→A",
+            "Year (oldest)", "Year (newest)",
+            "Most played", "Recently played", "Never played first",
+        ]
+        sel_sort = st.selectbox("Sort by", _SORT_OPTIONS, key="browse_sort")
+        n_cols   = st.select_slider("Columns", options=[1, 2, 3, 4], value=3, key="browse_cols")
+
+    # Header row: title | List/Grid toggle | Random
+    h1, h2, h3 = st.columns([5, 1, 1])
+    with h1:
+        st.header("Collection")
+    with h2:
+        _view_mode = st.session_state.get("view_mode", "Grid")
+        if st.button("📋 List" if _view_mode == "Grid" else "⊞ Grid", width = 'stretch'):
+            st.session_state["view_mode"] = "List" if _view_mode == "Grid" else "Grid"
+            st.rerun()
+    with h3:
+        if st.button("🎲 Random", width = 'stretch'):
+            st.session_state["trigger_random"] = True
+    view_mode = st.session_state.get("view_mode", "Grid")
+
+    # Search bar
+    search_query = st.text_input(
+        "Search",
+        placeholder="Search title, artist, or tags…",
+        label_visibility="collapsed",
+        key="browse_search",
+    )
+
+    # Filter
+    filtered = []
+    for r in _all_releases:
+        ct     = _get_ct(r["release_id"])
+        decade = _decade(r["year"], ct.get("decade_override"))
+        if search_query:
+            q = search_query.lower()
+            haystack = " ".join([
+                r.get("title") or "",
+                r.get("artist") or "",
+                " ".join(ct.get("custom_tags", [])),
+            ]).lower()
+            if q not in haystack:
+                continue
+        if sel_genres  and not any(g in r["discogs_genres"]      for g in sel_genres):
+            continue
+        if sel_decades and decade not in sel_decades:
+            continue
+        if sel_tags    and not any(t in ct.get("custom_tags", []) for t in sel_tags):
+            continue
+        filtered.append((r, ct))
+
+    # Sort
+    if sel_sort == "Artist A→Z":
+        filtered.sort(key=lambda x: (x[0].get("artist") or "").lower())
+    elif sel_sort == "Artist Z→A":
+        filtered.sort(key=lambda x: (x[0].get("artist") or "").lower(), reverse=True)
+    elif sel_sort == "Year (oldest)":
+        filtered.sort(key=lambda x: x[0].get("year") or 0)
+    elif sel_sort == "Year (newest)":
+        filtered.sort(key=lambda x: x[0].get("year") or 0, reverse=True)
+    elif sel_sort == "Most played":
+        filtered.sort(key=lambda x: _play_stats.get(x[0]["release_id"], {}).get("count", 0), reverse=True)
+    elif sel_sort == "Recently played":
+        filtered.sort(key=lambda x: _play_stats.get(x[0]["release_id"], {}).get("last_played", ""), reverse=True)
+    elif sel_sort == "Never played first":
+        filtered.sort(key=lambda x: (1 if x[0]["release_id"] in _play_stats else 0, (x[0].get("artist") or "").lower()))
+
+    # Random pick
+    if st.session_state.pop("trigger_random", False) and filtered:
+        st.session_state["random_pick"] = random.choice(filtered)[0]["release_id"]
+
+    if st.session_state.get("random_pick"):
+        _pick_id    = st.session_state["random_pick"]
+        _pick_match = next(((r, ct) for r, ct in filtered if r["release_id"] == _pick_id), None)
+        if _pick_match:
+            r_p, ct_p = _pick_match
+            with st.container(border=True):
+                pc1, pc2, pc3 = st.columns([1, 6, 2])
+                with pc1:
+                    _cover(r_p.get("cover_url"), width=80)
+                with pc2:
+                    st.markdown(f"🎲 **Random Pick:** {r_p['title']} — {r_p['artist']}")
+                    st.caption(f"{r_p['year'] or '?'} · {', '.join(r_p['discogs_genres']) or '—'}")
+                with pc3:
+                    if st.button("▶ Log Play", key="random_log_play", width = 'stretch'):
+                        with db.get_conn() as conn:
+                            db.log_play(conn, r_p["release_id"])
+                        st.session_state.pop("random_pick", None)
+                        st.rerun()
+                    if st.button("✕ Dismiss", key="random_dismiss", width = 'stretch'):
+                        st.session_state.pop("random_pick", None)
+                        st.rerun()
+        else:
+            st.session_state.pop("random_pick", None)
+
+    st.caption(f"Showing {len(filtered)} of {len(_all_releases)} records")
+
+    # ── List view ─────────────────────────────────────────────────────────────
+    if view_mode == "List":
+        for r, ct in filtered:
+            stats       = _play_stats.get(r["release_id"], {})
+            play_count  = stats.get("count", 0)
+            last_played = stats.get("last_played", "")
+            decade      = _decade(r["year"], ct.get("decade_override"))
+            genres_str  = ", ".join(r["discogs_genres"]) or "—"
+            custom_str  = " · ".join(ct.get("custom_tags", []))
+            lc1, lc2, lc3, lc4 = st.columns([1, 5, 4, 1])
+            with lc1:
+                _cover(r.get("cover_url"), width=55)
+            with lc2:
+                st.markdown(f"**{r['title']}**")
+                st.caption(r.get("artist", ""))
+            with lc3:
+                st.caption(f"{r['year'] or '?'} · {decade or '?'} · {genres_str}")
+                if custom_str:
+                    st.caption(f"🏷️ {custom_str}")
+                _badge = _pressing_badge(r)
+                if _badge:
+                    st.caption(_badge)
+                if play_count:
+                    lp_str = last_played[:10] if last_played else ""
+                    st.caption(f"▶ {play_count}× · last {lp_str}")
+            with lc4:
+                if st.button("▶", key=f"qplay_list_{r['release_id']}_{r['instance_id']}", help="Log play"):
+                    with db.get_conn() as conn:
+                        db.log_play(conn, r["release_id"])
+                    st.rerun()
+                with st.expander("✏️"):
+                    _existing = ct.get("custom_tags", [])
+                    _new_tags = st.multiselect(
+                        "Tags",
+                        options=sorted(all_custom_tags | set(_existing)),
+                        default=_existing,
+                        key=f"tags_list_{r['release_id']}_{r['instance_id']}",
+                        accept_new_options=True,
+                    )
+                    if st.button("Save", key=f"save_list_{r['release_id']}_{r['instance_id']}"):
+                        with db.get_conn() as conn:
+                            db.save_custom_tags(conn, r["release_id"], _new_tags, ct.get("notes", ""), ct.get("decade_override"))
+                        _custom_tags_cache.pop(r["release_id"], None)
+                        st.rerun()
+
+    # ── Grid view ─────────────────────────────────────────────────────────────
+    else:
+        for row_start in range(0, len(filtered), n_cols):
+            cols = st.columns(n_cols)
+            for col_idx, col in enumerate(cols):
+                idx = row_start + col_idx
+                if idx >= len(filtered):
+                    break
+                r, ct = filtered[idx]
+                stats       = _play_stats.get(r["release_id"], {})
+                play_count  = stats.get("count", 0)
+                last_played = stats.get("last_played", "")
+                decade      = _decade(r["year"], ct.get("decade_override"))
+                genres_str  = ", ".join(r["discogs_genres"]) or "—"
+                custom_str  = " · ".join(ct.get("custom_tags", []))
+
+                with col:
+                    _cover(r.get("cover_url"))
+                    st.markdown(f"**{r['title']}**")
+                    st.caption(f"{r['artist']} · {r['year'] or '?'} · {decade or '?'}")
+                    st.caption(genres_str)
+                    _badge = _pressing_badge(r)
+                    if _badge:
+                        st.caption(_badge)
+                    if custom_str:
+                        st.markdown(f"🏷️ {custom_str}")
+                    if play_count:
+                        lp_str = last_played[:10] if last_played else ""
+                        st.caption(f"▶ {play_count}× · last {lp_str}")
+
+                    if st.button("▶ Log Play", key=f"qplay_{r['release_id']}_{r['instance_id']}", width = 'stretch'):
+                        with db.get_conn() as conn:
+                            db.log_play(conn, r["release_id"])
+                        st.rerun()
+
+                    with st.expander("✏️ Edit tags"):
+                        st.caption("Discogs: " + (", ".join(r["discogs_genres"]) or "None"))
+                        st.caption("Styles:  " + (", ".join(r["discogs_styles"])  or "None"))
+                        existing_tags = ct.get("custom_tags", [])
+                        new_tags = st.multiselect(
+                            "Custom tags",
+                            options=sorted(all_custom_tags | set(existing_tags)),
+                            default=existing_tags,
+                            key=f"tags_{r['release_id']}_{r['instance_id']}",
+                            accept_new_options=True,
+                        )
+                        decade_choices = [""] + sorted(all_decades | ({decade} if decade else set()))
+                        current_override = str(ct.get("decade_override") or "")
+                        decade_override_str = st.selectbox(
+                            "Decade override",
+                            options=decade_choices,
+                            index=decade_choices.index(current_override) if current_override in decade_choices else 0,
+                            key=f"dec_{r['release_id']}_{r['instance_id']}",
+                        )
+                        notes = st.text_area(
+                            "Notes",
+                            value=ct.get("notes", ""),
+                            key=f"notes_{r['release_id']}_{r['instance_id']}",
+                            height=80,
+                        )
+                        if st.button("💾 Save", key=f"save_{r['release_id']}_{r['instance_id']}"):
+                            decade_override_val = int(decade_override_str.rstrip("s")) * 10 if decade_override_str else None
+                            with db.get_conn() as conn:
+                                db.save_custom_tags(conn, r["release_id"], new_tags, notes, decade_override_val)
+                            _custom_tags_cache.pop(r["release_id"], None)
+                            st.success("Saved.")
+                            st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: PLAY LOG
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Play Log":
+    st.header("Play Log")
+
+    with db.get_conn() as conn:
+        recent = db.get_recent_plays(conn, limit=200)
+
+    if not recent:
+        st.info("No plays logged yet. Use the ▶ Log Play button on any record.")
+        st.stop()
+
+    # Highlight: not played in 30+ days
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    stale = [
+        r for r in _all_releases
+        if r["release_id"] not in _play_stats
+        or datetime.fromisoformat(_play_stats[r["release_id"]]["last_played"]).replace(tzinfo=timezone.utc) < cutoff
+    ]
+
+    if stale:
+        with st.expander(f"⏰ {len(stale)} records not played in 30+ days"):
+            for r in stale[:20]:
+                st.write(f"• **{r['title']}** — {r['artist']}")
+            if len(stale) > 20:
+                st.caption(f"…and {len(stale) - 20} more")
+
+    st.subheader(f"Recent Plays ({len(recent)})")
+    st.caption("Click ❌ to delete an accidental entry.")
+
+    hc1, hc2, hc3, hc4, hc5 = st.columns([2, 3, 2, 3, 1])
+    hc1.caption("**Date**")
+    hc2.caption("**Title**")
+    hc3.caption("**Artist**")
+    hc4.caption("**Note**")
+    hc5.caption("**Del**")
+    st.divider()
+
+    for play in recent:
+        c1, c2, c3, c4, c5 = st.columns([2, 3, 2, 3, 1])
+        played_str = (play["played_at"] or "")[:16].replace("T", " ")
+        c1.caption(played_str)
+        c2.write(play.get("title") or "Unknown")
+        c3.caption(play.get("artist") or "")
+        c4.caption(play.get("notes") or "")
+        with c5:
+            if st.button("❌", key=f"del_play_{play['id']}", help="Delete this entry"):
+                with db.get_conn() as conn:
+                    db.delete_play(conn, play["id"])
+                st.rerun()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: DUPLICATES
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Duplicates":
+    st.header("Duplicates")
+
+    with db.get_conn() as conn:
+        dupes = db.get_duplicate_groups(conn)
+
+    exact    = dupes["exact"]
+    pressing = dupes["pressing"]
+
+    total = len(exact) + len(pressing)
+    if total == 0:
+        st.success("No duplicates found in your collection.")
+        st.stop()
+
+    st.caption(f"{len(exact)} exact duplicate group(s) · {len(pressing)} same-title pressing group(s)")
+
+    if exact:
+        st.subheader("Exact Duplicates (same release, multiple copies)")
+        for group in exact:
+            r0 = group[0]
+            with st.expander(f"{r0['title']} — {r0['artist']} ({len(group)} copies)"):
+                cols = st.columns(len(group))
+                for i, r in enumerate(group):
+                    with cols[i]:
+                        _cover(r.get("cover_url"), width=100)
+                        st.caption(f"Instance {r['instance_id']}")
+                        st.caption(r.get("format") or "—")
+
+    if pressing:
+        st.subheader("Different Pressings (same title, different releases)")
+        for group in pressing:
+            r0 = group[0]
+            with st.expander(f"{r0['title']} — {r0['artist']} ({len(group)} pressings)"):
+                cols = st.columns(len(group))
+                for i, r in enumerate(group):
+                    with cols[i]:
+                        _cover(r.get("cover_url"), width=100)
+                        st.caption(f"{r['year'] or '?'} · Release #{r['release_id']}")
+                        st.caption(r.get("format") or "—")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: STATS
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Stats":
+    st.header("Collection Stats")
+
+    if not _all_releases:
+        st.info("No records found. Use Re-sync Now to import your collection.")
+        st.stop()
+
+    total_value = _meta.get("total_collection_value")
+
+    # Top-level metrics
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Records", len(_all_releases))
+    c2.metric("Unique Release IDs", len({r["release_id"] for r in _all_releases}))
+    c3.metric("Total Plays", sum(s["count"] for s in _play_stats.values()))
+    c4.metric("Est. Collection Value", f"${total_value:,.2f}" if total_value else "—")
+
+    st.divider()
+
+    col_l, col_r = st.columns(2)
+
+    # Records by decade
+    with col_l:
+        st.subheader("Records by Decade")
+        decade_counts: dict[str, int] = {}
+        for r in _all_releases:
+            ct = _get_ct(r["release_id"])
+            d  = _decade(r["year"], ct.get("decade_override"))
+            if d:
+                decade_counts[d] = decade_counts.get(d, 0) + 1
+        if decade_counts:
+            df_d = pd.DataFrame.from_dict(decade_counts, orient="index", columns=["Count"])
+            df_d = df_d.sort_index()
+            st.bar_chart(df_d)
+
+    # Records by genre
+    with col_r:
+        st.subheader("Records by Genre")
+        genre_counts: dict[str, int] = {}
+        for r in _all_releases:
+            for g in r["discogs_genres"]:
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+        if genre_counts:
+            df_g = pd.DataFrame.from_dict(genre_counts, orient="index", columns=["Count"])
+            df_g = df_g.sort_values("Count", ascending=False)
+            st.bar_chart(df_g)
+
+    col_l2, col_r2 = st.columns(2)
+
+    # Records by format
+    with col_l2:
+        st.subheader("Records by Format")
+        fmt_counts: dict[str, int] = {}
+        for r in _all_releases:
+            f = r.get("format") or "Unknown"
+            fmt_counts[f] = fmt_counts.get(f, 0) + 1
+        if fmt_counts:
+            df_f = pd.DataFrame.from_dict(fmt_counts, orient="index", columns=["Count"])
+            df_f = df_f.sort_values("Count", ascending=False)
+            st.bar_chart(df_f)
+
+    # Most played
+    with col_r2:
+        st.subheader("Most Played Records")
+        if _play_stats:
+            top_played = sorted(_play_stats.items(), key=lambda x: x[1]["count"], reverse=True)[:10]
+            release_map = {r["release_id"]: r for r in _all_releases}
+            rows = []
+            for rid, s in top_played:
+                r = release_map.get(rid, {})
+                rows.append({
+                    "Title":  r.get("title", "Unknown"),
+                    "Artist": r.get("artist", ""),
+                    "Plays":  s["count"],
+                })
+            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        else:
+            st.caption("No plays logged yet.")
+
+    # Never played
+    st.divider()
+    never_played = [r for r in _all_releases if r["release_id"] not in _play_stats]
+    st.subheader(f"Never Played ({len(never_played)})")
+    if never_played:
+        df_np = pd.DataFrame([{"Title": r["title"], "Artist": r["artist"], "Year": r["year"]} for r in never_played])
+        st.dataframe(df_np, width='stretch', hide_index=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: DISCOVER
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Discover":
+    st.header("Discover")
+
+    with db.get_conn() as conn:
+        suggestions = db.get_suggestions(conn)
+        disc_meta   = db.get_sync_meta(conn)
+
+    last_sug = disc_meta.get("last_suggestions_fetch")
+    st.caption(f"Suggestions last refreshed: {_format_last_sync(last_sug)}")
+
+    if st.button("🔄 Refresh Suggestions"):
+        with st.status("Searching Discogs for related records…", expanded=True) as sug_status:
+            try:
+                count = api.fetch_suggestions(force=True, log_fn=sug_status.write)
+                sug_status.update(label=f"✅ Found {count} new suggestions.", state="complete")
+                st.rerun()
+            except EnvironmentError as e:
+                sug_status.update(label="❌ Configuration error", state="error")
+                st.error(str(e))
+            except Exception as e:
+                sug_status.update(label="❌ Failed", state="error")
+                st.error(f"Failed: {e}")
+
+    if not suggestions:
+        st.info(
+            "No suggestions yet. Click **Refresh Suggestions** to search Discogs "
+            "based on the genres in your collection."
+        )
+        st.stop()
+
+    # Genre filter for suggestions
+    sug_genres: set[str] = set()
+    for s in suggestions:
+        for g in s.get("genres", []):
+            sug_genres.add(g)
+    sel_sug_genres = st.multiselect("Filter by genre", sorted(sug_genres))
+
+    filtered_sug = [
+        s for s in suggestions
+        if not sel_sug_genres or any(g in s.get("genres", []) for g in sel_sug_genres)
+    ]
+
+    st.caption(f"Showing {len(filtered_sug)} suggestions")
+
+    COLS = 4
+    for row_start in range(0, len(filtered_sug), COLS):
+        cols = st.columns(COLS)
+        for col_idx, col in enumerate(cols):
+            idx = row_start + col_idx
+            if idx >= len(filtered_sug):
+                break
+            s = filtered_sug[idx]
+            with col:
+                _cover(s.get("cover_url"))
+                st.markdown(f"**{s['title']}**")
+                st.caption(f"{s['artist']} · {s['year'] or '?'}")
+                st.caption(", ".join(s.get("genres", [])) or "—")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PAGE: WANTLIST
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Wantlist":
+    st.header("🎯 Wantlist")
+
+    with db.get_conn() as _wl_conn:
+        _wantlist = db.get_wantlist(_wl_conn)
+        _wl_meta  = db.get_sync_meta(_wl_conn)
+
+    last_wl = _wl_meta.get("last_wantlist_sync")
+    st.caption(f"Wantlist last synced: {_format_last_sync(last_wl)}")
+
+    if st.button("🔄 Sync Wantlist", width = 'stretch'):
+        with st.status("Fetching wantlist from Discogs…", expanded=True) as _wls:
+            try:
+                _n = api.sync_wantlist(force=True, log_fn=_wls.write)
+                _wls.update(label=f"✅ Synced {_n} wantlist items.", state="complete")
+                st.rerun()
+            except EnvironmentError as e:
+                _wls.update(label="❌ Configuration error", state="error")
+                st.error(str(e))
+            except Exception as e:
+                _wls.update(label="❌ Sync failed", state="error")
+                st.error(str(e))
+
+    if not _wantlist:
+        st.info(
+            "Your wantlist is empty. Click **Sync Wantlist** to import from Discogs."
+        )
+        st.stop()
+
+    st.caption(f"{len(_wantlist)} item(s) on your wantlist")
+
+    # ── Vinyl filter ──────────────────────────────────────────────────────────
+    _VINYL_FORMATS = {"Vinyl", "LP", '7"', '10"', '12"'}
+
+    def _is_vinyl(fmt: str) -> bool:
+        return not fmt or any(v in fmt for v in _VINYL_FORMATS)
+
+    _vinyl_items = [w for w in _wantlist if _is_vinyl(w.get("format") or "")]
+    _hidden      = len(_wantlist) - len(_vinyl_items)
+
+    if not _vinyl_items:
+        st.info("No vinyl items found. Try **Sync Wantlist** to refresh.")
+        st.stop()
+
+    _caption = f"{len(_vinyl_items)} vinyl item(s)"
+    if _hidden:
+        _caption += f"  ·  {_hidden} non-vinyl hidden (CD / cassette / file)"
+    st.caption(_caption)
+
+    # ── Main table ────────────────────────────────────────────────────────────
+    _df_rows = []
+    for _w in _vinyl_items:
+        _press = _pressing_badge(_w)
+        _df_rows.append({
+            "cover":   _w.get("cover_url") or "",
+            "Artist":  _w["artist"],
+            "Title":   _w["title"],
+            "Year":    str(_w["year"]) if _w["year"] else "—",
+            "Genres":  ", ".join(_w.get("genres") or []) or "—",
+            "Edition": _press or "—",
+            "Notes":   _w.get("notes") or "",
+            "Discogs": f"https://www.discogs.com/release/{_w['release_id']}",
+        })
+    _wl_df = pd.DataFrame(_df_rows)
+    st.dataframe(
+        _wl_df,
+        column_config={
+            "cover":   st.column_config.ImageColumn("", width="small"),
+            "Artist":  st.column_config.TextColumn("Artist"),
+            "Title":   st.column_config.TextColumn("Title"),
+            "Year":    st.column_config.TextColumn("Year"),
+            "Genres":  st.column_config.TextColumn("Genres"),
+            "Edition": st.column_config.TextColumn("Edition"),
+            "Notes":   st.column_config.TextColumn("Notes"),
+            "Discogs": st.column_config.LinkColumn("🔗", display_text="View"),
+        },
+        hide_index=True,
+        width = 'stretch',
+    )
+
+    # ── Listings ──────────────────────────────────────────────────────────────
+    st.subheader("📊 Listings")
+
+    def _lst_key(rid: int) -> str:
+        return f"wl_listings_{rid}"
+
+    # Pre-populate session state from DB so listings survive page refresh
+    with db.get_conn() as _conn:
+        for _w in _vinyl_items:
+            _key = _lst_key(_w["release_id"])
+            if _key not in st.session_state:
+                _db_rows = db.get_wantlist_listings(_conn, _w["release_id"])
+                if _db_rows:
+                    st.session_state[_key] = [
+                        {
+                            "listing_id":     r["listing_id"],
+                            "seller":         r["seller"],
+                            "condition":      r["condition"],
+                            "sleeve":         r["sleeve_condition"],
+                            "ships_from":     r["ships_from"],
+                            "price":          r["price"],
+                            "currency":       r["currency"],
+                            "url":            r["listing_url"],
+                            "price_usd":      r.get("price_usd"),
+                            "ships_to_us":    r.get("ships_to_us"),
+                            "shipping_notes": r.get("shipping_notes"),
+                            "last_fetched":   r.get("last_fetched"),
+                        }
+                        for r in _db_rows
+                    ]
+
+    _all_done  = all(_lst_key(w["release_id"]) in st.session_state for w in _vinyl_items)
+    _btn_label = "♻️ Re-fetch All Listings" if _all_done else "📊 Fetch All Listings"
+
+    if st.button(_btn_label, width = 'stretch'):
+        _prog = st.progress(0, text="Fetching listings…")
+        _now  = datetime.utcnow().isoformat()
+        with db.get_conn() as _conn:
+            for _i, _w in enumerate(_vinyl_items):
+                _prog.progress(
+                    (_i + 1) / len(_vinyl_items),
+                    text=f"[{_i + 1}/{len(_vinyl_items)}] {_w['artist']} — {_w['title']}",
+                )
+                _fetched = api.fetch_release_listings(_w["release_id"])
+                st.session_state[_lst_key(_w["release_id"])] = _fetched
+                for _lst in _fetched:
+                    if _lst.get("listing_id") is None:
+                        continue  # skip fallback aggregate rows
+                    db.upsert_wantlist_listing(_conn, {
+                        "listing_id":       _lst["listing_id"],
+                        "release_id":       _w["release_id"],
+                        "price":            _lst.get("price"),
+                        "currency":         _lst.get("currency"),
+                        "condition":        _lst.get("condition"),
+                        "sleeve_condition": _lst.get("sleeve"),
+                        "ships_from":       _lst.get("ships_from"),
+                        "seller":           _lst.get("seller"),
+                        "listing_url":      _lst.get("url"),
+                        "last_fetched":     _now,
+                        "price_usd":        _lst.get("price_usd"),
+                        "ships_to_us":      _lst.get("ships_to_us"),
+                        "shipping_notes":   _lst.get("shipping_notes"),
+                    })
+            _conn.commit()
+        _prog.empty()
+        st.rerun()
+
+    _fetched_items = [w for w in _vinyl_items if _lst_key(w["release_id"]) in st.session_state]
+    if _fetched_items:
+        _all_rows: list[dict] = []
+        _last_fetched_dates: list[str] = []
+        for _w in _fetched_items:
+            _listings = st.session_state[_lst_key(_w["release_id"])]
+            if _listings and _listings[0].get("listing_id") is not None:
+                # Per-listing rows from scraper
+                for _lst in _listings:
+                    _all_rows.append({
+                        "Artist":      _w["artist"],
+                        "Title":       _w["title"],
+                        "Condition":   _lst.get("condition"),
+                        "Sleeve":      _lst.get("sleeve"),
+                        "Ships From":  _lst.get("ships_from"),
+                        "Ships to US": {1: "Yes", 0: "No"}.get(_lst.get("ships_to_us"), "?"),
+                        "Price":       _lst.get("price"),
+                        "Currency":    _lst.get("currency", ""),
+                        "Price (USD)": _lst.get("price_usd"),
+                        "Seller":      _lst.get("seller"),
+                        "Listing":     _lst.get("url"),
+                    })
+                    if _lst.get("last_fetched"):
+                        _last_fetched_dates.append(_lst["last_fetched"])
+            elif _listings:
+                # Fallback aggregate row
+                _s = _listings[0]
+                _all_rows.append({
+                    "Artist":      _w["artist"],
+                    "Title":       _w["title"],
+                    "Condition":   None,
+                    "Sleeve":      None,
+                    "Ships From":  None,
+                    "Ships to US": "?",
+                    "Price":       _s.get("price"),
+                    "Currency":    _s.get("currency", ""),
+                    "Price (USD)": _s.get("price") if _s.get("currency") == "USD" else None,
+                    "Seller":      None,
+                    "Listing":     _s.get("url"),
+                })
+
+        _lst_df = pd.DataFrame(_all_rows)
+        if not _lst_df.empty and "Price (USD)" in _lst_df.columns:
+            _lst_df = _lst_df.sort_values("Price (USD)", ascending=True, na_position="last")
+
+        _n_loaded = len(_fetched_items)
+        _n_total  = len(_vinyl_items)
+        _cap = f"{len(_all_rows)} listing(s) across {_n_loaded} record(s)"
+        if _n_loaded < _n_total:
+            _cap += f"  ·  {_n_loaded} of {_n_total} loaded"
+        if _last_fetched_dates:
+            _cap += f"  ·  last fetched {max(_last_fetched_dates)[:10]}"
+        st.caption(_cap)
+
+        st.dataframe(
+            _lst_df,
+            column_config={
+                "Artist":      st.column_config.TextColumn("Artist"),
+                "Title":       st.column_config.TextColumn("Title"),
+                "Condition":   st.column_config.TextColumn("Condition"),
+                "Sleeve":      st.column_config.TextColumn("Sleeve"),
+                "Ships From":  st.column_config.TextColumn("Ships From"),
+                "Ships to US": st.column_config.TextColumn("Ships to US"),
+                "Price":       st.column_config.NumberColumn("Price", format="%.2f"),
+                "Currency":    st.column_config.TextColumn("Currency"),
+                "Price (USD)": st.column_config.NumberColumn("Price (USD)", format="$%.2f"),
+                "Seller":      st.column_config.TextColumn("Seller"),
+                "Listing":     st.column_config.LinkColumn("Listing", display_text="View"),
+            },
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.info("Click **Fetch All Listings** to load available copies for all wantlist records.")
+
+

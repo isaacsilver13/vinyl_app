@@ -1,0 +1,35 @@
+# flyctl launch added from .gitignore
+# Environment & secrets
+**/.env
+**/*.env
+
+# SQLite databases
+**/*.db
+**/*.db-shm
+**/*.db-wal
+
+# Python
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.Python
+**/*.egg-info
+**/dist
+**/build
+
+# Virtual environments
+**/venv
+**/.venv
+**/env
+
+# VS Code
+**/.vscode
+
+# OS
+**/.DS_Store
+**/Thumbs.db
+
+# Logs
+**/*.log
+fly.toml

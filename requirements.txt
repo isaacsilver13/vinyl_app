@@ -1,0 +1,9 @@
+streamlit>=1.35.0
+python3-discogs-client>=2.8
+python-dotenv>=1.0.0
+pandas>=2.0.0
+cloudscraper>=1.2.71
+beautifulsoup4>=4.12
+streamlit-aggrid>=0.3.4
+plotly>=5.0.0
+bcrypt>=4.0.0
