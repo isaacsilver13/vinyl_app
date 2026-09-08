@@ -35,8 +35,6 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           # Install flyctl
-          curl -L https://fly.io/install.sh | sh
-          export PATH="$HOME/.fly/bin:$PATH"
 
           # SSH into the running machine and run the refresh script
           flyctl ssh console \
