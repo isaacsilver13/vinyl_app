@@ -23,6 +23,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Validate Fly.io authentication
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          test -n "$FLY_API_TOKEN" || { echo "FLY_API_TOKEN is not configured."; exit 1; }
+          flyctl auth whoami
+
       - name: Run refresh via Fly.io SSH
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
