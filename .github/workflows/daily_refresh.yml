@@ -33,12 +33,34 @@ jobs:
           test -n "$FLY_API_TOKEN" || { echo "FLY_API_TOKEN is not configured."; exit 1; }
           flyctl auth whoami
 
+      - name: Start Fly machine for refresh
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          machine_json="$(flyctl machine list --app vinyl-catalog --json)"
+          machine_id="$(jq -r '.[0].id // empty' <<< "$machine_json")"
+          machine_state="$(jq -r '.[0].state // empty' <<< "$machine_json")"
+
+          if [ -z "$machine_id" ]; then
+            echo "No Fly machine found for vinyl-catalog."
+            exit 1
+          fi
+
+          echo "Using Fly machine $machine_id (state: $machine_state)."
+          if [ "$machine_state" != "started" ]; then
+            flyctl machine start "$machine_id" --app vinyl-catalog
+          fi
+          flyctl machine wait "$machine_id" \
+            --app vinyl-catalog \
+            --state started \
+            --wait-timeout 5m
+
       - name: Run refresh via Fly.io SSH
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
-          # Install flyctl
-
           # SSH into the running machine and run the refresh script
           flyctl ssh console \
             --app vinyl-catalog \
