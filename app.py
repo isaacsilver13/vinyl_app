@@ -98,9 +98,15 @@ def _show_login() -> None:
             if submitted:
                 with db.get_master_conn() as _conn:
                     _row = db.get_user_by_username(_conn, username.strip())
-                if _row and bcrypt.checkpw(
-                    password.encode(), _row["password_hash"].encode()
-                ):
+                try:
+                    _password_ok = _row and bcrypt.checkpw(
+                        password.encode(), _row["password_hash"].encode()
+                    )
+                except ValueError:
+                    # A malformed/non-bcrypt password_hash (e.g. from a
+                    # provisioning script bug) must not crash the login form.
+                    _password_ok = False
+                if _password_ok:
                     st.session_state["current_user"] = dict(_row)
                     st.rerun()
                 else:

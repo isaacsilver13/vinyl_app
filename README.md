@@ -19,9 +19,9 @@ The app stores its local data under `VINYL_DATA_DIR`, which defaults to the repo
 Run the API separately from the `vinyl_api` repository:
 
 ```powershell
-$env:VINYL_API_URL = 'http://127.0.0.1:8000'
+$env:VINYL_API_URL = 'http://127.0.0.1:8003'
 $env:VINYL_API_KEY = ''
-python -m uvicorn vinyl_api.main:app --reload
+python -m uvicorn vinyl_api.main:app --reload --port 8003
 ```
 
 For the deployed app, set `VINYL_API_URL` to `https://vinyl-api.fly.dev` and set the same `VINYL_API_KEY` on both Fly applications.

@@ -2,6 +2,8 @@ import os
 import sys
 from pathlib import Path
 
+import bcrypt
+
 PROJECT_ROOT = Path(os.environ.get("PROJECT_ROOT", str(Path(__file__).resolve().parents[1]))).resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -26,7 +28,10 @@ with database.get_master_conn() as conn:
         conn.commit()
         print('Updated user isilver13')
     else:
-        password_hash = 'autogen_' + token[:8]
+        import secrets
+        generated_password = secrets.token_urlsafe(12)
+        password_hash = bcrypt.hashpw(generated_password.encode(), bcrypt.gensalt()).decode()
         database.create_user(conn, username, password_hash, token, discogs_username, f'vinyl_{username}.db', None)
         conn.commit()
         print('Created user isilver13')
+        print(f'Generated password (record this now, it is not stored anywhere else): {generated_password}')
